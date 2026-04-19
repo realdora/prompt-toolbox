@@ -2,8 +2,8 @@ name: Supabase Keepalive
 
 on:
   schedule:
-    # Every 6 days at 12:00 UTC (well within the 7-day inactivity threshold)
-    - cron: '0 12 */6 * *'
+    # Every Monday and Thursday at 12:00 UTC — max gap 4 days, safely under the 7-day pause threshold
+    - cron: '0 12 * * 1,4'
   workflow_dispatch:
 
 jobs:
@@ -11,17 +11,51 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Ping Supabase REST API
+        shell: bash
         run: |
-          response=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
-            "${{ secrets.SUPABASE_URL }}/rest/v1/")
+          set +e
+
+          url="${{ secrets.SUPABASE_URL }}"
+          key="${{ secrets.SUPABASE_ANON_KEY }}"
+
+          echo "URL length: ${#url}"
+          echo "KEY length: ${#key}"
+          if [ -z "$url" ] || [ -z "$key" ]; then
+            echo "::error::SUPABASE_URL or SUPABASE_ANON_KEY secret is empty"
+            exit 1
+          fi
+          url="${url%/}"
+
+          host=$(echo "$url" | sed -E 's|https?://||; s|/.*||')
+          echo "Resolving host: $host"
+          if ! getent hosts "$host" > /dev/null; then
+            echo "::error::DNS resolution failed for $host — project is likely PAUSED. Restore at https://supabase.com/dashboard"
+            exit 1
+          fi
+
+          response=$(curl -sS -o /tmp/body -w "%{http_code}" \
+            -H "apikey: $key" \
+            -H "Authorization: Bearer $key" \
+            "$url/rest/v1/prompts?select=id&limit=1")
+          curl_exit=$?
+
+          echo "curl exit: $curl_exit"
           echo "HTTP status: $response"
-          # Any HTTP response (even 401/404) means Supabase is alive and counted activity.
-          # Only fail if there was no response at all (curl error → empty string).
-          if [ -n "$response" ] && [ "$response" -ge 100 ]; then
-            echo "Supabase project responded — activity registered, project will not pause"
+          echo "Response body (first 200 chars):"
+          head -c 200 /tmp/body; echo
+
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "::error::curl failed with exit $curl_exit"
+            exit 1
+          fi
+
+          if [ "$response" -ge 200 ] && [ "$response" -lt 300 ]; then
+            echo "Supabase responded $response — activity registered"
+            exit 0
+          elif [ "$response" -ge 400 ] && [ "$response" -lt 500 ]; then
+            echo "::warning::Got $response — project alive but auth/query may be invalid. Check SUPABASE_ANON_KEY."
             exit 0
           else
-            echo "No response from Supabase — project may be down or URL wrong"
+            echo "::error::Unexpected status $response"
             exit 1
           fi
